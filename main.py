@@ -19,7 +19,7 @@ st.write("Upload an image to detect skin conditions")
 @st.cache_resource
 def load_model():
     try:
-        interpreter = tf.lite.Interpreter(model_path="model.tflite")
+        interpreter = tf.lite.Interpreter(model_path="skin_lesion_model.tflite")
         interpreter.allocate_tensors()
         return interpreter
     except Exception as e:
@@ -88,7 +88,7 @@ interpreter = load_model()
 labels = load_labels()
 
 if interpreter is None:
-    st.error("Failed to load the model. Please check if 'model.tflite' exists in the repository.")
+    st.error("Failed to load the model. Please check if 'skin_lesion_model.tflite' exists in the repository.")
     st.stop()
 
 # File uploader
