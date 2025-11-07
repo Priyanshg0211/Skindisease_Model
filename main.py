@@ -19,9 +19,21 @@ st.write("Upload an image to detect skin conditions")
 @st.cache_resource
 def load_model():
     try:
-        interpreter = tf.lite.Interpreter(model_path="skin_lesion_model.tflite")
+        # Try the actual model file name first
+        model_path = "sagalyze_skin_model.tflite"
+        interpreter = tf.lite.Interpreter(model_path=model_path)
         interpreter.allocate_tensors()
         return interpreter
+    except FileNotFoundError:
+        # Fallback to alternative name
+        try:
+            model_path = "skin_lesion_model.tflite"
+            interpreter = tf.lite.Interpreter(model_path=model_path)
+            interpreter.allocate_tensors()
+            return interpreter
+        except Exception as e:
+            st.error(f"Error loading model: {str(e)}")
+            return None
     except Exception as e:
         st.error(f"Error loading model: {str(e)}")
         return None
@@ -38,20 +50,66 @@ def load_labels():
         return ["Class 0", "Class 1", "Class 2", "Class 3"]
 
 # Preprocess image
-def preprocess_image(image, input_shape):
+def preprocess_image(image, input_shape, input_details):
     # Convert to RGB if necessary
     if image.mode != "RGB":
         image = image.convert("RGB")
     
-    # Resize to model input size
-    image = image.resize((input_shape[1], input_shape[2]))
+    # Get input dimensions (handle both NHWC and NCHW formats)
+    # Input shape is typically [1, height, width, channels] for NHWC
+    if len(input_shape) == 4:
+        # NHWC format: [batch, height, width, channels]
+        height, width = input_shape[1], input_shape[2]
+    elif len(input_shape) == 3:
+        # No batch dimension: [height, width, channels]
+        height, width = input_shape[0], input_shape[1]
+    else:
+        height, width = input_shape[0], input_shape[1]
     
-    # Convert to array and normalize
+    # Resize to model input size (use high-quality resampling)
+    try:
+        image = image.resize((width, height), Image.Resampling.LANCZOS)
+    except AttributeError:
+        # Fallback for older PIL versions
+        image = image.resize((width, height), Image.LANCZOS)
+    
+    # Convert to array (keep as float32 initially for processing)
     img_array = np.array(image, dtype=np.float32)
-    img_array = img_array / 255.0  # Normalize to [0, 1]
     
-    # Add batch dimension
-    img_array = np.expand_dims(img_array, axis=0)
+    # Check input type and normalize accordingly
+    input_type = input_details[0]['dtype']
+    
+    if input_type == np.uint8:
+        # For uint8 input, keep values in [0, 255] range
+        img_array = np.clip(img_array, 0, 255).astype(np.uint8)
+    else:
+        # For float32 input, normalize to [0, 1]
+        img_array = img_array / 255.0
+        img_array = img_array.astype(np.float32)
+    
+    # Handle input shape format (NHWC vs NCHW)
+    if len(input_shape) == 4:
+        # Add batch dimension if not present
+        if len(img_array.shape) == 3:
+            img_array = np.expand_dims(img_array, axis=0)
+    elif len(input_shape) == 3:
+        # No batch dimension needed
+        pass
+    else:
+        # Handle 2D input shapes (grayscale)
+        if len(img_array.shape) == 2:
+            img_array = np.expand_dims(img_array, axis=-1)  # Add channel dimension
+    
+    # Ensure the shape matches exactly (handle any mismatches)
+    expected_shape = tuple(input_shape)
+    if img_array.shape != expected_shape:
+        try:
+            img_array = img_array.reshape(expected_shape)
+        except ValueError:
+            # If reshape fails, try to fix common issues
+            if len(expected_shape) == 4 and len(img_array.shape) == 3:
+                img_array = np.expand_dims(img_array, axis=0)
+            img_array = img_array.reshape(expected_shape)
     
     return img_array
 
@@ -65,7 +123,7 @@ def predict(interpreter, image, labels):
     input_shape = input_details[0]['shape']
     
     # Preprocess image
-    processed_img = preprocess_image(image, input_shape)
+    processed_img = preprocess_image(image, input_shape, input_details)
     
     # Set input tensor
     interpreter.set_tensor(input_details[0]['index'], processed_img)
@@ -75,11 +133,32 @@ def predict(interpreter, image, labels):
     
     # Get output tensor
     output_data = interpreter.get_tensor(output_details[0]['index'])
-    predictions = output_data[0]
+    
+    # Handle different output shapes
+    if len(output_data.shape) > 1:
+        predictions = output_data[0]
+    else:
+        predictions = output_data
+    
+    # Apply softmax to convert logits to probabilities (if needed)
+    # Check if predictions are already probabilities (sum close to 1) or logits
+    pred_sum = np.sum(predictions)
+    if pred_sum > 1.1 or pred_sum < 0.9 or np.any(predictions < 0):
+        # Likely logits, apply softmax
+        exp_predictions = np.exp(predictions - np.max(predictions))  # Numerical stability
+        predictions = exp_predictions / np.sum(exp_predictions)
+    
+    # Ensure predictions are within valid range
+    predictions = np.clip(predictions, 0.0, 1.0)
+    predictions = predictions / np.sum(predictions)  # Normalize to sum to 1
     
     # Get top prediction
     predicted_class_idx = np.argmax(predictions)
-    confidence = predictions[predicted_class_idx]
+    confidence = float(predictions[predicted_class_idx])
+    
+    # Ensure predicted index is within valid range
+    if predicted_class_idx >= len(labels):
+        predicted_class_idx = 0
     
     return predicted_class_idx, confidence, predictions
 
@@ -88,7 +167,7 @@ interpreter = load_model()
 labels = load_labels()
 
 if interpreter is None:
-    st.error("Failed to load the model. Please check if 'skin_lesion_model.tflite' exists in the repository.")
+    st.error("Failed to load the model. Please check if 'sagalyze_skin_model.tflite' or 'skin_lesion_model.tflite' exists in the repository.")
     st.stop()
 
 # File uploader
@@ -124,10 +203,15 @@ if uploaded_file is not None:
                     value=f"{confidence * 100:.2f}%"
                 )
                 
-                # Show all predictions
+                # Show all predictions (sorted by confidence)
                 st.write("### All Predictions:")
-                for i, (label, prob) in enumerate(zip(labels, all_predictions)):
-                    st.progress(float(prob), text=f"{label}: {prob * 100:.2f}%")
+                # Sort predictions by confidence
+                sorted_indices = np.argsort(all_predictions)[::-1]
+                for idx in sorted_indices:
+                    if idx < len(labels):
+                        label = labels[idx]
+                        prob = float(all_predictions[idx])
+                        st.progress(prob, text=f"{label}: {prob * 100:.2f}%")
                 
             except Exception as e:
                 st.error(f"Error during prediction: {str(e)}")
